@@ -1,0 +1,332 @@
+\documentclass[handout]{beamer}
+\usetheme{LSE}
+\usepackage{color}
+\usepackage{hyperref}
+	\hypersetup{
+		colorlinks=true,
+		linkcolor=black
+		}
+\usepackage{graphics}
+\usepackage{pgfplots}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage[round]{natbib} 
+\usepackage{fancyvrb}
+  
+\usepackage{amsmath,amsthm,amsfonts}
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Title Slide %%%%%%%%%%%%%%%%%%%%%%%%%%
+\title[Speeding up R]{A quick guide to speeding up R code} \author[]{
+    Rafal Baranowski
+}
+\date{LSE 2015, 3 February}
+
+\newif\ifplot
+
+
+%This controls wheter plots are compiled. \plottrue works only lualatex is used for compilation.
+\plottrue
+
+\newcommand{\tikzfigure}[2]{
+
+	\begin{figure}[h!]
+		\ifplot  	
+			\resizebox{0.9\textwidth}{!}{\input{tikz/#1.tex}}
+		\else
+			Plot will be inserted here.
+		\fi		
+		\caption{#2}
+	\end{figure} 
+}
+\beamerdefaultoverlayspecification{<+->}
+
+\begin{document}    
+ 
+\frame{\titlepage} 
+
+
+
+\begin{frame}
+	\frametitle{Introduction}
+	\begin{itemize}
+		\item Why R is slow?
+		\item Why R is not necessarily slow?
+		\item Possible ways of speeding up R code
+			\begin{itemize}
+				\item vectorisation,
+				\item preallocation of the memory,
+				\item using optimised R packages (e.g. RcppEigen for solving linear systems),
+				\item using R byte code compiler,
+				\item \textbf{running R computations in parallel},
+				\item \textbf{code profiling}, 
+				\item \textbf{writing R extensions in C or C++},
+				\item \textbf{using optimised system libraries},
+				\item ...
+			\end{itemize}
+	\end{itemize}
+
+\end{frame}
+
+\begin{frame}
+	\frametitle{Estimating volatility with Exponentially Weighted Exponential Average (EWEA)}
+	Let $X_{t}$, $t=1, \ldots, n$ be a univariate time series with $E X_{t}=0$ and $\sigma^{2}_{t}=E X_{t}^{2} <\infty$. Let $\lambda\in(0,1)$. We consider
+	\begin{align*}
+		\hat{\sigma}_{1} &= X_{1}^{2},\\
+		\hat{\sigma}_{t} &= \lambda X_{t}^{2} +(1-\lambda) \sigma_{t}^{2},\quad, t=2,\ldots,n
+	\end{align*}
+	Our goal is to \textbf{quickly compute} $\hat{\sigma}_{t}$ for $MC$ time series, where both $n$ and $MC$ are large.
+\end{frame}
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: R only code}
+The exponential smoother is straightforward to code:
+
+\begin{Verbatim}[fontsize=\footnotesize]
+#X is a n by MC matrix, lambda is a scalar
+vol.exp.smooth.r <- function(X, lambda, ...){
+  apply(X, 2, function(x){
+    n <- length(x)     
+    vol <- rep(0, n) #preallocate memory if you can!
+    vol[1] <- x[1]^2    
+    for(j in 2:n) vol[j] <-  lambda * x[j]^2 + (1-lambda) * vol[j-1]    
+    return(vol)    
+  })    
+}
+\end{Verbatim}
+
+\end{frame}
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: Execution time of the R only code} 
+Running 
+
+\begin{Verbatim}[fontsize=\footnotesize]
+n <- 2000 #length of each vector
+lambda <- 0.05 #parameter for the exponential smoother
+MC <- 10000 #number of Monte-Carlo repetitions
+X <- matrix(rnorm(n*MC), n, MC)
+
+system.time(vol <- vol.exp.smooth.r(X = X, lambda = lambda))
+\end{Verbatim}
+takes
+\begin{Verbatim}[fontsize=\footnotesize]
+user  system elapsed 
+ 34.173   0.099  34.288 
+\end{Verbatim}
+which is not that quick even though $n$ and $MC$ are rather moderate in this example.
+\end{frame}
+
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: R code using multiple cores}
+In the previous example, we used just one core for computations. We can easily run computations in parallel, using all available cores. First we need to start a cluster of multiple R instances.
+\begin{Verbatim}[fontsize=\footnotesize]
+\require(parallel) #R package for parallel computations
+no.cores <- 8 #depending on machine (usually 4 to 8)
+cl <-  makeCluster(no.cores) #this runs no.core instances of R
+\end{Verbatim}
+Next we slightly modify the \texttt{vol.exp.smooth.r} function.
+
+\begin{Verbatim}[fontsize=\footnotesize]
+vol.exp.smooth.rpcl <- function(X, lambda, cl, ...){
+  clusterExport(cl, list("lambda")) #make sure that all nodes know lambda
+  parApply(cl, X, 2, function(x){ #parallel version of apply 
+    n <- length(x)  
+    vol <- rep(0, n)
+    vol[1] <- x[1]^2  
+    for(j in 2:n) vol[j] <-  lambda * x[j]^2 + (1-lambda) * vol[j-1]  
+    return(vol)
+  })
+}
+\end{Verbatim}
+\end{frame}
+
+\begin{frame}[fragile]
+\frametitle{EWEA: Execution time of the R code using multiple cores}
+
+\begin{itemize}
+\item In theory, we should get 8-fold speed-up in our example. In reality,
+\begin{Verbatim}[fontsize=\footnotesize]
+system.time(vol <- vol.exp.smooth.rpcl(X, lambda, cl))
+\end{Verbatim}
+takes 
+\begin{Verbatim}[fontsize=\footnotesize]
+   user  system elapsed 
+  2.777   0.583  11.436
+\end{Verbatim}
+which is roughly 3 times quicker.
+\item  This is due to the fact that the nodes need to be synchronised and as a results \textbf{some of the computations are run sequentially, not in parallel}.
+\end{itemize}
+
+
+\end{frame}
+
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: Code profiling with \texttt{Rprof}}
+	To identify bottlenecks in our code, we can use R profiling tools.
+\begin{Verbatim}[fontsize=\footnotesize]
+Rprof() #start profiling
+vol <- vol.exp.smooth.r(X = X, lambda = lambda)
+Rprof(NULL) #stop profiling
+summaryRprof()
+\end{Verbatim}
+Not surprisingly, computation of the volatility takes the majority of time.
+\begin{Verbatim}[fontsize=\footnotesize]
+                self.time self.pct total.time total.pct
+"FUN"               31.70    87.52      35.66     98.45
+"^"                  1.48     4.09       1.48      4.09
+"-"                  1.10     3.04       1.10      3.04
+"*"                  0.82     2.26       0.82      2.26
+"+"                  0.28     0.77       0.28      0.77
+"("                  0.26     0.72       0.26      0.72
+"apply"              0.22     0.61      36.22    100.00
+"array"              0.22     0.61       0.22      0.61
+"aperm.default"      0.08     0.22       0.08      0.22
+"unlist"             0.04     0.11       0.04      0.11
+":"                  0.02     0.06       0.02      0.06
+
+\end{Verbatim}
+
+\end{frame}
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: Writing C extensions for R}
+	\begin{itemize}
+		\item R is an interpreted language with dynamic typing, therefore functions written in R are not optimal. 
+		\item We can write R extensions in low-level programming languages such as C/C++/Fortran to significantly speed-up our functions.
+		\item In our example it is actually quite easy!
+	\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+	\frametitle{EWEA: C code}
+We start from writing C function calculating $\hat{\sigma}_{t}$ for all $t=1,\ldots,n$.
+
+\begin{Verbatim}[fontsize=\footnotesize]
+#include <R.h>
+
+void vol_exp_smooth(double *x, int *n, double *lambda, double *vol){
+  
+  unsigned int i = 0;
+  vol[0] = x[0]*x[0]; 
+  for(i=1; i<(*n); i++)
+   vol[i] = (*lambda) * (x[i-1] *x[i-1]) + (1-(*lambda))*vol[i-1]; 
+  
+}
+\end{Verbatim}
+
+\end{frame}
+
+\begin{frame}[fragile]
+\frametitle{EWEA: R wrapper for the C code}
+Then we write an R wrapper for the C function.
+
+\begin{Verbatim}[fontsize=\footnotesize]
+vol.exp.smooth.rpc <- function(X, lambda, ...){  
+  apply(X, 2, function(x){    
+    res <- .C("vol_exp_smooth", as.double(x), as.integer(length(x)),
+     as.double(lambda), as.double(rep(0,length(x))))
+    vol <- res[[4]]    
+    return(vol)
+  })
+}
+\end{Verbatim}
+
+The following command can be used to compile the C function.
+\begin{Verbatim}[fontsize=\footnotesize]
+	#this line produces vol_exp_smooth.so (Linux)
+	#or vol_exp_smooth.dll (Windows) file
+	R CMD SHLIB vol_exp_smooth.c  -fopenmp #produces 
+\end{Verbatim}
+
+\end{frame}
+
+\begin{frame}[fragile]
+\frametitle{EWEA: Running C code in R}
+	To use our C function in R, we need to make sure is loaded.
+\begin{Verbatim}[fontsize=\footnotesize]
+if(!is.loaded("vol_exp_smooth")) dyn.load("../lib/vol_exp_smooth.so")
+system.time(vol <- vol.exp.smooth.rpc(X = X, lambda = lambda))
+\end{Verbatim}
+The code is 44 time quicker than the single-core R version!
+\begin{Verbatim}[fontsize=\footnotesize]
+   user  system elapsed 
+  0.747   0.076   0.823 
+\end{Verbatim}  
+\end{frame}
+\begin{frame}
+	\frametitle{EWEA: Performance study}
+		\tikzfigure{vol_exp_smooth_normalscale}{Performance of the discussed implementations of the exponential smoothing with $MC=256$ }
+\end{frame}
+
+
+\begin{frame}
+	\frametitle{EWEA: Performance study}
+		\tikzfigure{vol_exp_smooth_logscale}{Performance of the discussed implementations of the exponential smoothing  $MC=256$ (logarithmic scale)}
+\end{frame}
+
+\begin{frame}
+	\frametitle{Speeding up Linear Algebra: Introduction}
+	
+	How does R perform linear algebra?
+	\begin{itemize}
+		\item Simple operations (vector-vector addition, matrix-vector or matrix-matrix multiplication, etc.) are implemented in a BLAS library (Basic Linear Algebra Subprograms).
+		\item More advanced linear algebra (QR decomposition, matrix inverse, etc.) are implemented in LAPACK (LAPACK — Linear Algebra PACKage).
+		\item BLAS and LAPACK are written in Fortran. R calls their functions internally. 
+	\end{itemize}
+\end{frame}
+
+\begin{frame}
+	\frametitle{Speeding up Linear Algebra: Introduction}
+	
+	\begin{itemize}
+		\item There is a number of various implementations of BLAS and LAPACK routines more optimal than ATLAS used by R.
+		\begin{itemize}
+			\item OpenBLAS (BLAS and LAPACK, even more support for parallel computations, free)
+			\item IntelMKL (BLAS and LAPACK, parallel computations, optimised for Intel CPU's, paid license required)
+			\item NVBLAS (BLAS only, performs computations on a GPU, requires CUDA capable-device, free)
+		\end{itemize}
+		\item \textbf{Replacing the standard libraries with one of the above can result in a substantial speed-up of R code}.
+	\end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+	\frametitle{Speeding up Linear Algebra: Matrix multiplication example}
+We test standard BLAS, OpenBLAS  using the following example.
+\begin{Verbatim}[fontsize=\footnotesize]
+
+    n <- 512
+    
+    A <- matrix(rnorm(n^2), n, n)
+    B <- matrix(rnorm(n^2), n, n)
+    
+    system.time(C <- A%*%B)
+    
+\end{Verbatim}
+
+\end{frame}
+
+
+\begin{frame}
+	\frametitle{Speeding up Linear Algebra: Matrix multiplication example}
+		\tikzfigure{matrix_multiplciations_normalscale}{Performance of matrix multiplication for various implementations of BLAS [Intel(R) Xeon(R) CPU E5-1620 0 @ 3.60GHz, NVidia Quadro 4000]}
+\end{frame}
+
+\begin{frame}
+	\frametitle{Speeding up Linear Algebra: Matrix multiplication example}
+		\tikzfigure{matrix_multiplciations_logscale}{Performance of matrix multiplication for various implementations of BLAS (logarithmic scale)[Intel(R) Xeon(R) CPU E5-1620 0 @ 3.60GHz, NVidia Quadro 4000]}
+\end{frame}
+
+\begin{frame}
+	\frametitle{Resources}
+	\begin{itemize}
+		\item R and C code and this presentation (\url{http://personal.lse.ac.uk/baranows/}).
+		\item An OpenBLAS-based Rblas for Windows 64: Step-by-step (\url{http://www.r-bloggers.com/an-openblas-based-rblas-for-windows-64-step-by-step/}).
+		\item For faster R use OpenBLAS instead: better than ATLAS, trivial to switch to on Ubuntu (\url{http://www.r-bloggers.com/for-faster-r-use-openblas-instead-better-than-atlas-trivial-to-switch-to-on-ubuntu/}).
+	\end{itemize}
+\end{frame}
+
+
+\end{document}
